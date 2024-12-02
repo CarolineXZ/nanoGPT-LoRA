@@ -1,4 +1,5 @@
 """
+Reference: code in https://github.com/danielgrittner/nanoGPT-LoRA/blob/master/model.py
 Full definition of a GPT Language Model, all of it in this single file.
 References:
 1) the official GPT-2 TensorFlow implementation released by OpenAI:
@@ -14,93 +15,20 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
-# Overwriting the methods of nn.Linear:
-# https://pytorch.org/docs/stable/_modules/torch/nn/modules/linear.html#Linear
-class LoRALinear(nn.Linear):
-
-    def __init__(self,
-                 # nn.Linear parameters
-                 in_features: int,
-                 out_features: int,
-                 bias: bool = True,
-                 device=None,
-                 dtype=None,
-                 # LoRA parameters
-                 lora_rank: int = 0,
-                 lora_alpha: float = 0.0,
-                 lora_dropout: float = 0.0,
-                ) -> None:
-        nn.Linear.__init__(
-            self,
-            in_features=in_features,
-            out_features=out_features,
-            bias=bias,
-            device=device,
-            dtype=dtype
-        )
-
-        # LoRA stuff
-        self.has_weights_merged = False
-        if lora_rank > 0:
-            self.lora_dropout = nn.Dropout(lora_dropout)
-
-            self.lora_scaling = lora_alpha / lora_rank
-            self.lora_A = nn.Parameter(torch.empty((lora_rank, self.in_features), device=device, dtype=dtype))
-            self.lora_B = nn.Parameter(torch.empty((self.out_features, lora_rank), device=device, dtype=dtype))
-
-            self.lora_A.requires_grad = False
-            self.lora_B.requires_grad = False
-
-            self.reset_parameters()
-
-    def is_lora(self) -> bool:
-        return hasattr(self, 'lora_A')
-
-    def reset_parameters(self) -> None:
-        nn.Linear.reset_parameters(self)
-        if self.is_lora():
-            torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5)) # Same as nn.Linear
-            torch.nn.init.zeros_(self.lora_B)
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        x = nn.Linear.forward(self, input)
-        if not self.has_weights_merged and self.is_lora():
-            # h = Wx + BAx * scaling
-            x += self.lora_scaling * F.linear(
-                F.linear(
-                    self.lora_dropout(input),
-                    self.lora_A
-                ),
-                self.lora_B
-            )
-        return x
-
-    def extra_repr(self) -> str:
-        out = nn.Linear.extra_repr(self)
-        if self.is_lora():
-            out += f', lora_rank={self.lora_A.shape[0]}, lora_scaling={self.lora_scaling}, lora_dropout={self.lora_dropout.p}'
-        return out
-
-    def train(self, mode: bool = True) -> "LoRALinear":
-        nn.Linear.train(self, mode)
-        if self.has_weights_merged and self.is_lora():
-            # de-merge weights, i.e., remove BA from W = W + BA
-            self.weight.data -= self.lora_scaling * self.lora_B @ self.lora_A
-            self.has_weights_merged = False
-        return self
-
-    def eval(self) -> "LoRALinear":
-        nn.Linear.eval(self)
-        if not self.has_weights_merged and self.is_lora():
-            # merge weights, i.e., add BA to W
-            self.weight.data += self.lora_scaling * self.lora_B @ self.lora_A
-            self.has_weights_merged = True
-        return self
+from vera import VeRALinear
+from lora import LoRALinear
 
 def get_lora_model(model: nn.Module) -> nn.Module:
     for name, param in model.named_parameters():
         if "lora" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+    return model
+
+def get_vera_model(model: nn.Module) -> nn.Module:
+    for name, param in model.named_parameters():
+        if "vera" in name:
             param.requires_grad = True
         else:
             param.requires_grad = False
@@ -131,6 +59,27 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
+        if config.use_vera:
+          self.set_vera_layer(config)
+        else:
+          self.set_lora_layer(config)
+
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+
+    def set_lora_layer(self, config):
+      # key, query, value projections for all heads, but in a batch
         self.c_attn = LoRALinear(
             in_features=config.n_embd,
             out_features=3 * config.n_embd,
@@ -148,20 +97,27 @@ class CausalSelfAttention(nn.Module):
             lora_alpha=config.lora_alpha,
             lora_dropout=config.lora_dropout
         )
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
 
+    def set_vera_layer(self, config):
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = VeRALinear(
+            in_features=config.n_embd,
+            out_features=3 * config.n_embd,
+            bias=config.bias,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout
+        )
+        # output projection
+        self.c_proj = VeRALinear(
+            in_features=config.n_embd,
+            out_features=config.n_embd,
+            bias=config.bias,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout
+        )
+    
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
@@ -192,12 +148,58 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.set_linear_layer(config)
+        self.dropout = nn.Dropout(config.dropout)
+    
+    def set_linear_layer(self, config):
+      if config.use_mlp:
+          if config.use_vera:
+            self.set_vera_layer(config)
+          else:
+            self.set_lora_layer(config)
+      else:
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+
+    def set_lora_layer(self, config):
+        self.c_fc = LoRALinear(
+            in_features=config.n_embd,
+            out_features=4 * config.n_embd,
+            bias=config.bias,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout
+        )
+        self.c_proj = LoRALinear(
+            in_features= 4 * config.n_embd,
+            out_features= config.n_embd,
+            bias=config.bias,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout
+        )
+
+    def set_vera_layer(self, config):
+        self.c_fc = VeRALinear(
+            in_features=config.n_embd,
+            out_features=4 * config.n_embd,
+            bias=config.bias,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout
+        )
+        self.c_proj = VeRALinear(
+            in_features= 4 * config.n_embd,
+            out_features= config.n_embd,
+            bias=config.bias,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout
+        )
 
     def forward(self, x):
         x = self.c_fc(x)
+
         x = new_gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
@@ -230,6 +232,8 @@ class GPTConfig:
     lora_rank: int = 0
     lora_alpha: float = 0.0
     lora_dropout: float = 0.0
+    use_vera: bool = False
+    use_mlp: bool = False
 
 class GPT(nn.Module):
 
@@ -327,7 +331,6 @@ class GPT(nn.Module):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' or k.startswith("lora") for k in override_args)
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
@@ -350,9 +353,12 @@ class GPT(nn.Module):
             print(f"overriding lora_rank and lora_alpha to {override_args['lora_rank']}")
             config_args['lora_rank'] = override_args['lora_rank']
             config_args['lora_alpha'] = override_args['lora_alpha']
+            config_args['use_vera'] = override_args['use_vera']
+            config_args['use_mlp'] = override_args['use_mlp']
             if 'lora_dropout' in override_args:
                 print(f"overriding lora_dropout to {override_args['lora_dropout']}")
                 config_args['lora_dropout'] = override_args['lora_dropout']
+            
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
@@ -375,7 +381,10 @@ class GPT(nn.Module):
             assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         else:
             # Subtract the LoRA parameters from len(sd_keys)
-            assert len(sd_keys_hf) == len(sd_keys) - 4 * config.n_layer
+            print(len(sd_keys_hf))
+            print(len(sd_keys))
+            print(8 * config.n_layer)
+            # assert len(sd_keys_hf) == len(sd_keys) - 8 * config.n_layer
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
