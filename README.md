@@ -1,7 +1,8 @@
 
-# nanoGPT - LoRA
+# nanoGPT - LoRA and Vera 
 
-Adapted nanoGPT to support LoRA.
+1. add Vera
+2. Add LoRA to the MLP layer 
 
 ### TODOs
 
