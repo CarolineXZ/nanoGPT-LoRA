@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT, get_lora_model
+from model import GPTConfig, GPT, get_lora_model, get_vera_model
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -60,6 +60,7 @@ lora_rank = 0
 lora_alpha = 0.0 # set alpha to the first rank which is tried, then keep it fixed, and don't further tune it (see the paper for more info)
 lora_dropout = 0.0
 compute_grad_memory = False # compute the memory usage of the gradients
+use_vera = False
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -184,12 +185,18 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
-
+    
+    
     if lora_rank > 0:
-        # Only make LoRA weights tunable
-        print("Marking model as LoRA fine-tunable...")
-        model = get_lora_model(model)
-        print("Done.")
+        if use_vera:
+            print("Marking model as VeRA fine-tunable...")
+            model = get_vera_model(model)
+            print("Done.")
+        else:  
+            # Only make LoRA weights tunable
+            print("Marking model as LoRA fine-tunable...")
+            model = get_lora_model(model)
+            print("Done.")
 
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
@@ -199,6 +206,7 @@ elif init_from.startswith('gpt2'):
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
+        use_vera = use_vera,
     )
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
@@ -206,10 +214,15 @@ elif init_from.startswith('gpt2'):
         model_args[k] = getattr(model.config, k)
     
     if lora_rank > 0:
-        # Only make LoRA weights tunable
-        print("Marking model as LoRA fine-tunable...")
-        model = get_lora_model(model)
-        print("Done.")
+        if use_vera:
+            print("Marking model as VeRA fine-tunable...")
+            model = get_vera_model(model)
+            print("Done.")
+        else:
+            # Only make LoRA weights tunable
+            print("Marking model as LoRA fine-tunable...")
+            model = get_lora_model(model)
+            print("Done.")
 
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
