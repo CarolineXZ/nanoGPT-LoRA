@@ -7,8 +7,8 @@ init_from = 'gpt2-medium'
 lora_rank = 1024 
 lora_alpha = 1024 * 2 
 lora_dropout = 0
-use_vera = False
-use_mlp = False
+use_vera = True
+use_mlp = True
 
 out_dir = f'out-lora-shakespeare-{init_from}-{lora_rank}-{lora_alpha}'
 eval_interval = 5
