@@ -1,9 +1,16 @@
 import time
 
 dataset = 'shakespeare'
-init_from = 'gpt2'
+init_from = 'gpt2-medium'
 
-out_dir = f'out-lora-shakespeare-{init_from}-2'
+# LoRA parameters
+lora_rank = 1024 
+lora_alpha = 1024 * 2 
+lora_dropout = 0
+use_vera = False
+use_mlp = False
+
+out_dir = f'out-lora-shakespeare-{init_from}-{lora_rank}-{lora_alpha}'
 eval_interval = 5
 eval_iters = 40
 wandb_log = False # feel free to turn on
@@ -23,12 +30,10 @@ max_iters = 20
 # finetune at constant LR
 learning_rate = 2e-4
 decay_lr = False
+# weight decay
+# weight_decay = 1e-1
 
-device = 'mps'
+device = 'cuda'
 compile = False
 compute_grad_memory = True
 
-# LoRA parameters
-lora_rank = 8
-lora_alpha = 32
-lora_dropout = 0
